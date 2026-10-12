@@ -16,6 +16,8 @@ import sqlite3
 import json
 import urllib.request
 import threading
+import asyncio
+from contextlib import asynccontextmanager
 from collections import namedtuple
 from datetime import datetime, timedelta, date
 from typing import Optional
@@ -24,7 +26,27 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import pandas as pd
 
-app = FastAPI(title="绿洲大模型 - 作物模拟 API", version="2.1.0")
+# ★ 启动时后台预热常用坐标的土壤缓存（土壤是静态数据，取一次长期复用；
+#    配合外部保活让实例常驻，用户提问时基本都是缓存命中、秒回）
+SOIL_WARM_COORDS = [(38.48, 77.26), (41.17, 80.25), (44.30, 86.03), (43.92, 81.32), (43.82, 87.62)]
+
+async def warm_soil_cache_task():
+    await asyncio.sleep(5)
+    for lat, lon in SOIL_WARM_COORDS:
+        try:
+            await asyncio.to_thread(soilgrids_to_soildata, lat, lon, 90, 2)
+            print(f"[预热] 土壤缓存 {lat},{lon} 完成")
+        except Exception as e:
+            print(f"[预热] 土壤缓存 {lat},{lon} 失败: {e}")
+        await asyncio.sleep(3)
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(warm_soil_cache_task())
+    yield
+    task.cancel()
+
+app = FastAPI(title="绿洲大模型 - 作物模拟 API", version="2.1.0", lifespan=lifespan)
 
 # ========== API Key 保护 ==========
 # 设置 OASIS_API_KEY 环境变量后，所有请求需带 X-API-Key 头
@@ -110,13 +132,14 @@ def _daily_val(daily: dict, key: str, i: int):
     arr = daily.get(key) or []
     return arr[i] if i < len(arr) else None
 
-def fetch_soilgrids(lat, lon):
+def fetch_soilgrids(lat, lon, timeout=50, retries=1):
     """从 ISRIC SoilGrids 获取土壤属性剖面"""
     url = (f"{SOILGRIDS_URL}?lon={lon}&lat={lat}"
            f"&property=clay&property=sand&property=silt&property=bdod&property=soc"
            f"&depth=0-5cm&depth=5-15cm&depth=15-30cm&depth=30-60cm&depth=60-100cm"
            f"&value=mean")
-    return http_get_json(url)
+    # ★ ISRIC 实测 23~90s 才返回（波动极大），默认 30s×3 次常常整轮白跑
+    return http_get_json(url, timeout=timeout, retries=retries)
 
 def _depth_value(layer, depths):
     """按优先级取深度层值"""
@@ -146,10 +169,26 @@ def texture_class(sand, clay):
     if clay >= 35: return "黏土"
     return "壤土"
 
-def soilgrids_to_soildata(lat, lon):
-    """SoilGrids 数据 → WOFOST 土壤参数 (soildata dict)"""
+# ★ 土壤属性缓存：同一坐标只查一次真实数据源（土壤是静态数据，进程内永久有效；重启即重建）
+_soil_cache = {}
+_soil_lock = threading.Lock()
+
+def soilgrids_to_soildata(lat, lon, timeout=50, retries=1):
+    """SoilGrids 数据 → WOFOST 土壤参数 (soildata dict)。带坐标缓存，命中即秒回。"""
+    try:
+        key = (round(float(lat), 3), round(float(lon), 3))
+    except Exception:
+        key = None
+    if key is not None:
+        with _soil_lock:
+            hit = _soil_cache.get(key)
+        if hit is not None:
+            sd, info = hit
+            info = dict(info)
+            info["cached"] = True
+            return sd, info
     depths = ["30-60cm", "15-30cm", "5-15cm", "0-5cm"]
-    data = fetch_soilgrids(lat, lon)
+    data = fetch_soilgrids(lat, lon, timeout=timeout, retries=retries)
     props = {layer["name"]: layer for layer in data["properties"]["layers"]}
 
     def safe(layer, div):
@@ -204,6 +243,10 @@ def soilgrids_to_soildata(lat, lon):
         "used_default": used_default,
         "data_source": "ISRIC SoilGrids",
     }
+    if key is not None and not used_default:
+        # 只缓存真实取到的数据；回退默认值的不缓存，下次还能再试
+        with _soil_lock:
+            _soil_cache[key] = (soildata, dict(soil_info))
     return soildata, soil_info
 
 # ============================================================
@@ -662,6 +705,7 @@ def soil_check(lat: float, lon: float):
             "location": {"lat": lat, "lon": lon},
             "soil": soil_info,
             "wofost_params": soildata,
+            "cached": bool(soil_info.get("cached")),
         }
     except Exception as e:
         return {
