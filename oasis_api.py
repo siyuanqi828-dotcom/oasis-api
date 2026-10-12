@@ -30,21 +30,10 @@ import pandas as pd
 #    配合外部保活让实例常驻，用户提问时基本都是缓存命中、秒回）
 SOIL_WARM_COORDS = [(38.48, 77.26), (41.17, 80.25), (44.30, 86.03), (43.92, 81.32), (43.82, 87.62)]
 
-async def warm_soil_cache_task():
-    await asyncio.sleep(5)
-    for lat, lon in SOIL_WARM_COORDS:
-        try:
-            await asyncio.to_thread(soilgrids_to_soildata, lat, lon, 90, 2)
-            print(f"[预热] 土壤缓存 {lat},{lon} 完成")
-        except Exception as e:
-            print(f"[预热] 土壤缓存 {lat},{lon} 失败: {e}")
-        await asyncio.sleep(3)
-
 @asynccontextmanager
 async def lifespan(app):
-    task = asyncio.create_task(warm_soil_cache_task())
+    threading.Thread(target=_soil_warm_forever, daemon=True).start()
     yield
-    task.cancel()
 
 app = FastAPI(title="绿洲大模型 - 作物模拟 API", version="2.1.0", lifespan=lifespan)
 
@@ -132,7 +121,7 @@ def _daily_val(daily: dict, key: str, i: int):
     arr = daily.get(key) or []
     return arr[i] if i < len(arr) else None
 
-def fetch_soilgrids(lat, lon, timeout=50, retries=1):
+def fetch_soilgrids(lat, lon, timeout=45, retries=1):
     """从 ISRIC SoilGrids 获取土壤属性剖面"""
     url = (f"{SOILGRIDS_URL}?lon={lon}&lat={lat}"
            f"&property=clay&property=sand&property=silt&property=bdod&property=soc"
@@ -171,9 +160,53 @@ def texture_class(sand, clay):
 
 # ★ 土壤属性缓存：同一坐标只查一次真实数据源（土壤是静态数据，进程内永久有效；重启即重建）
 _soil_cache = {}
+_soil_retry = set()
 _soil_lock = threading.Lock()
 
-def soilgrids_to_soildata(lat, lon, timeout=50, retries=1):
+
+def _soil_retry_add(key):
+    with _soil_lock:
+        if key not in _soil_cache:
+            _soil_retry.add(key)
+
+
+def _soil_retry_take():
+    with _soil_lock:
+        keys = [k for k in _soil_retry if k not in _soil_cache]
+        _soil_retry.clear()
+        return keys
+
+
+def _soil_warm_forever():
+    """后台守护线程：不限期把常用坐标 + 用户查过但失败的坐标补齐进缓存。
+    ISRIC 源很慢（50~90s，还会超时），只能靠"提前取好 + 命中缓存"保证用户体验。
+    只对 5 个常用坐标 + 实际被问到的坐标取数，不主动扫点。"""
+    time.sleep(10)
+    round_no = 0
+    while True:
+        round_no += 1
+        todo = []
+        with _soil_lock:
+            for lat, lon in SOIL_WARM_COORDS:
+                k = (round(float(lat), 3), round(float(lon), 3))
+                if k not in _soil_cache:
+                    todo.append(k)
+            for k in list(_soil_retry):
+                if k not in _soil_cache and k not in todo:
+                    todo.append(k)
+        for lat, lon in todo:
+            try:
+                soilgrids_to_soildata(lat, lon, timeout=90, retries=3)
+                print(f"[土壤预热] 第{round_no}轮 已缓存 {lat},{lon}")
+            except Exception as e:
+                print(f"[土壤预热] 第{round_no}轮 {lat},{lon} 暂不可得: {type(e).__name__}")
+            time.sleep(5)
+        with _soil_lock:
+            cached = len(_soil_cache)
+        print(f"[土壤预热] 第{round_no}轮结束，缓存坐标 {cached} 个，待补 {len(todo)} 个；15 分钟后再查")
+        time.sleep(900)
+
+def soilgrids_to_soildata(lat, lon, timeout=45, retries=1):
     """SoilGrids 数据 → WOFOST 土壤参数 (soildata dict)。带坐标缓存，命中即秒回。"""
     try:
         key = (round(float(lat), 3), round(float(lon), 3))
@@ -188,7 +221,12 @@ def soilgrids_to_soildata(lat, lon, timeout=50, retries=1):
             info["cached"] = True
             return sd, info
     depths = ["30-60cm", "15-30cm", "5-15cm", "0-5cm"]
-    data = fetch_soilgrids(lat, lon, timeout=timeout, retries=retries)
+    try:
+        data = fetch_soilgrids(lat, lon, timeout=timeout, retries=retries)
+    except Exception:
+        if key is not None:
+            _soil_retry_add(key)      # ★ 失败进后台补取队列，不限期重试直到缓存成功
+        raise
     props = {layer["name"]: layer for layer in data["properties"]["layers"]}
 
     def safe(layer, div):
@@ -774,7 +812,7 @@ def _simulate_impl(req: SimRequest):
 
         # 2. 真实土壤参数 (SoilGrids)，失败则用默认
         try:
-            soildata, soil_info = soilgrids_to_soildata(req.latitude, req.longitude)
+            soildata, soil_info = soilgrids_to_soildata(req.latitude, req.longitude, timeout=55, retries=1)
         except Exception as e:
             print(f"[simulate] SoilGrids 获取失败，使用默认土壤: {e}")
             soil_info = {"soil_texture": "默认壤土(参考)", "used_default": True, "error": str(e)[:100]}
